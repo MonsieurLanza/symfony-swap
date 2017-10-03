@@ -11,13 +11,14 @@
 
 namespace Florianv\SwapBundle\DependencyInjection;
 
+use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Loader\XmlFileLoader;
 use Symfony\Component\DependencyInjection\Reference;
-use Symfony\Bridge\Doctrine\DependencyInjection\AbstractDoctrineExtension;
 
 /**
  * The container extension.
@@ -36,80 +37,64 @@ class FlorianvSwapExtension extends Extension
 
         $config = $this->processConfiguration(new Configuration(), $config);
 
-        $container->setAlias('florianv_swap.http_adapter', $config['http_adapter']);
+        $this->configureCacheService($container, $config['cache']);
 
-        $this->loadProviders($config['providers'], $container);
-
-        if (isset($config['cache'])) {
-            $this->loadCache($config['cache'], $container);
+        $builderDefinition = $container->getDefinition('florianv_swap.builder');
+        foreach ($config['providers'] as $name => $config) {
+            $builderDefinition->addMethodCall('add', [$name, $config]);
         }
-    }
-
-    private function loadProviders(array $config, ContainerBuilder $container)
-    {
-        foreach ($config as $providerName => $providerConfig) {
-            switch ($providerName) {
-                case 'fixer':
-                case 'yahoo_finance':
-                case 'google_finance':
-                case 'european_central_bank':
-                case 'national_bank_of_romania':
-                case 'webservicex':
-                case 'central_bank_of_republic_turkey':
-                    $this->addProvider($container, $providerName, array(
-                        new Reference('florianv_swap.http_adapter'),
-                    ), $providerConfig['priority']);
-                    break;
-
-                case 'open_exchange_rates':
-                    $this->addProvider($container, $providerName, array(
-                        new Reference('florianv_swap.http_adapter'),
-                        $providerConfig['app_id'],
-                        $providerConfig['enterprise']
-                    ), $providerConfig['priority']);
-                    break;
-
-                case 'xignite':
-                    $this->addProvider($container, $providerName, array(
-                        new Reference('florianv_swap.http_adapter'),
-                        $providerConfig['token'],
-                    ), $providerConfig['priority']);
-                    break;
-            }
-        }
-    }
-
-    private function loadCache(array $config, ContainerBuilder $container)
-    {
-        if (in_array($config['doctrine']['type'], ['apc', 'apcu', 'array', 'xcache', 'wincache', 'zenddata'], true)) {
-            $cacheProvider = new Definition('%florianv_swap.cache.doctrine.'.$config['doctrine']['type'].'.class%');
-            $cacheProvider->setPublic(false);
-        } else {
-            $cacheProvider = new Reference($config['doctrine']['type']);
-        }
-
-        $cacheDefinition = new Definition('%florianv_swap.cache.doctrine.class%', array(
-            $cacheProvider,
-            $config['ttl']
-        ));
-        $cacheDefinition->setPublic(false);
-
-        $container->getDefinition('florianv_swap.swap')->replaceArgument(1, $cacheDefinition);
     }
 
     /**
-     * Creates the provider definition and add it to the container.
+     * Configures the cache service.
      *
      * @param ContainerBuilder $container
-     * @param string           $name
-     * @param array            $arguments
+     * @param array            $config
      */
-    private function addProvider(ContainerBuilder $container, $name, array $arguments = array(), $priority = null)
+    public function configureCacheService(ContainerBuilder $container, array $config)
     {
-        $definition = new Definition('%florianv_swap.provider.'.$name.'.class%', $arguments);
-        $definition->setPublic(false);
-        $definition->addTag('florianv_swap.provider', array('priority' => $priority));
+        if (empty($type = $config['type'])) {
+            return;
+        }
 
-        $container->setDefinition(sprintf('florianv_swap.provider.%s', $name), $definition);
+        $ttl = $config['ttl'];
+        $id = 'florianv_swap.cache';
+
+        if (in_array($type, ['array', 'apcu', 'filesystem'], true)) {
+            switch ($type) {
+                case 'array':
+                    $class = 'Symfony\Component\Cache\Adapter\ArrayAdapter';
+                    break;
+                case 'apcu':
+                    $class = 'Symfony\Component\Cache\Adapter\ApcuAdapter';
+                    break;
+                case 'filesystem':
+                    $class = 'Symfony\Component\Cache\Adapter\FilesystemAdapter';
+                    break;
+                default:
+                    throw new InvalidArgumentException("Unexpected swap cache type '$type'.");
+            }
+
+            if (!class_exists($class)) {
+                throw new InvalidArgumentException("Cache class $class does not exist.");
+            }
+
+            $definition = new Definition($class, ['swap', $ttl]);
+            $container->setDefinition($id, $definition);
+        } elseif ($container->hasDefinition($type)) {
+            $definition = $container->getDefinition($type);
+            if (!is_subclass_of($definition->getClass(), CacheItemPoolInterface::class)) {
+                throw new InvalidArgumentException("Service '$type' does not implements " . CacheItemPoolInterface::class);
+            }
+
+            $id = $type;
+        } else {
+            throw new InvalidArgumentException("Unexpected swap cache type '$type'.");
+        }
+
+        $definition = $container->getDefinition('florianv_swap.builder');
+        $definition
+            ->replaceArgument(0, ['ttl' => $ttl])
+            ->addMethodCall('useCacheItemPool', [new Reference($id)]);
     }
 }
